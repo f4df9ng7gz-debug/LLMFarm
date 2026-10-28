@@ -1,0 +1,107 @@
+name: Build unsigned iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-ios.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Check Xcode and CMake
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          cmake --version
+          git rev-parse HEAD
+          git submodule status --recursive
+
+      - name: Build llama framework for iOS devices
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/logs
+          python3 - <<'PY'
+          from pathlib import Path
+          root = Path('llmfarm_core.swift/llama.cpp')
+          source = (root / 'build-xcframework.sh').read_text()
+          helper_marker = 'echo "Building for iOS simulator..."'
+          device_marker = 'echo "Building for iOS devices..."'
+          end_marker = 'echo "Building for macOS..."'
+          helpers, rest = source.split(helper_marker, 1)
+          _, device = rest.split(device_marker, 1)
+          device, _ = device.split(end_marker, 1)
+          finish = '''
+          setup_framework_structure "build-ios-device" "${IOS_MIN_OS_VERSION}" "ios"
+          combine_static_libraries "build-ios-device" "Release-iphoneos" "ios" "false"
+          xcodebuild -create-xcframework \
+            -framework "$PWD/build-ios-device/framework/llama.framework" \
+            -debug-symbols "$PWD/build-ios-device/dSYMs/llama.dSYM" \
+            -output "$PWD/build-apple/llama.xcframework"
+          '''
+          (root / 'build-ios-device-only.sh').write_text(helpers + device + finish)
+          PY
+          (
+            cd llmfarm_core.swift/llama.cpp
+            bash build-ios-device-only.sh
+          ) 2>&1 | tee build/logs/llama-build.log
+
+      - name: Build iPhone and iPad app
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project LLMFarm.xcodeproj \
+            -scheme LLMFarm_Release \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$PWD/build/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY= \
+            DEVELOPMENT_TEAM= \
+            build 2>&1 | tee build/logs/app-build.log
+
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$PWD/build/DerivedData/Build/Products/Release-iphoneos/LLMFarm.app"
+          test -f "$app/LLMFarm"
+          mkdir -p build/package/Payload
+          ditto "$app" build/package/Payload/LLMFarm.app
+          (
+            cd build/package
+            zip -qry ../LLMFarm-unsigned.ipa Payload
+          )
+          unzip -t build/LLMFarm-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: LLMFarm-unsigned-iOS
+          path: build/LLMFarm-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LLMFarm-build-logs
+          path: build/logs/
+          if-no-files-found: ignore
+          retention-days: 7
